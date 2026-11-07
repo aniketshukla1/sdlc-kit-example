@@ -1,0 +1,435 @@
+#!/usr/bin/env bash
+# Tests the run-checks scripts (in a throwaway git repo), the mr-feedback scripts and the Cursor command hook.
+# Run it after changing any of them.
+# Backend, frontend and migration checks are replaced by stubs, so no Python/Node is needed;
+# the real migration and backend checks run with PYTHON=echo or a fake python; glab, npx and the OpenAPI export are faked.
+# Last line is "ALL OK" or "FAILED: <n> case(s)". Exit code 0 / 1.
+set -uo pipefail
+unset CHANGED MB
+
+SRC="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+T="$(mktemp -d)"; F="$(mktemp -d)"  # F: fake tools, outside the repo so git clean keeps them
+trap 'rm -rf "$T" "$F"' EXIT
+cd "$T" || exit 1
+git init -q -b main . || exit 1
+git config user.email selftest@example.com; git config user.name selftest
+git config commit.gpgsign false; git config core.hooksPath /dev/null
+[ "$(git rev-parse --show-toplevel)" = "$(pwd -P)" ] || { echo "Not in the temp repo; stopping."; exit 1; }
+
+S=.cursor/skills/run-checks/scripts
+mkdir -p "$S" .agent backend/app/models backend/tests backend/alembic/versions frontend/src
+cp "$SRC/check_all.sh" "$SRC/check_size.sh" "$SRC/check_guards.sh" "$SRC/check_scope.sh" "$SRC/check_api_types.sh" "$SRC/proof_pack.sh" \
+  "$SRC/check_coverage.sh" "$S/"
+cp "$SRC/check_migration.sh" real_check_migration.sh; cp "$SRC/check_backend.sh" real_check_backend.sh
+cp "$SRC/check_frontend.sh" real_check_frontend.sh
+cp "$SRC/db_guard.sh" .
+for s in check_backend check_frontend check_migration; do printf 'echo "RAN %s"\n' "$s" > "$S/$s.sh"; done
+printf '# none\n' > .agent/guard-exceptions.txt
+printf '# none\n' > .agent/size-allowlist.txt
+printf '# minimum\n90\n' > .agent/coverage.txt
+printf 'work/\n' > .agent/.gitignore
+printf 'x = 1\n' > backend/app/models/order.py
+printf 'def test_a():\n    assert 1 == 1\n\n\ndef test_b():\n    assert 2 == 2\n' > backend/tests/test_order.py
+printf 'stages: [test]\n' > .gitlab-ci.yml
+printf '[tool.ruff]\nselect = ["E", "F"]\n' > pyproject.toml
+printf 'export const a = 1;\n' > frontend/src/a.ts
+printf 'revision = "001"\n' > backend/alembic/versions/001_init.py
+seq 1 10 | sed 's/^/y = /' > backend/app/ten.py
+git add -A && git commit -qm base || exit 1
+export BASE_REF=main
+failures=0
+
+start() { git reset -q --hard && git clean -qfd && git switch -q main && git switch -qC case; }
+verdict() {  # $1 = case, $2 = 1 if as expected, $3 = output
+  if [ "$2" -eq 1 ]; then echo "ok    $1"; return; fi
+  echo "WRONG $1"; printf '%s\n' "$3" | sed 's/^/      /'; failures=$((failures + 1))
+}
+expect() {  # $1 = case, $2 = PASS|FAIL, then text the check_all output must contain
+  local name="$1" want="$2" out last s ok=1; shift 2
+  out="$(bash "$S/check_all.sh" 2>&1)"; last="$(printf '%s\n' "$out" | tail -n 1)"
+  if [ "$want" = PASS ]; then [ "$last" = "ALL PASS" ] || ok=0; else [ "${last#FAIL}" != "$last" ] || ok=0; fi
+  for s in "$@"; do printf '%s\n' "$out" | grep -qF -- "$s" || ok=0; done
+  verdict "$name" "$ok" "$out"
+}
+mig() {  # $1 = case, $2 = CHANGED ("" = run on its own), $3 = text that must appear, $4 = text that must not
+  local out ok=1
+  if [ -n "$2" ]; then out="$(CHANGED="$2" DB_URL_VAR=SELFTEST_DB SELFTEST_DB=mysql://u:p@localhost:3306/app PYTHON=echo bash real_check_migration.sh 2>&1)"
+  else out="$(DB_URL_VAR=SELFTEST_DB SELFTEST_DB=mysql://u:p@localhost:3306/app PYTHON=echo bash real_check_migration.sh 2>&1)"; fi
+  printf '%s\n' "$out" | grep -qF -- "$3" || ok=0
+  if [ -n "$4" ] && printf '%s\n' "$out" | grep -qF -- "$4"; then ok=0; fi
+  [ "$(printf '%s\n' "$out" | tail -n 1)" = "MIGRATION PASS" ] || ok=0
+  verdict "$1" "$ok" "$out"
+}
+
+start; printf 'def helper():\n    return 1\n' > backend/app/util.py
+expect "normal change passes" PASS
+start; printf 'print("debug")\n' >> backend/app/models/order.py
+expect "print() fails" FAIL "[debug/ignore]"
+start; printf 'print("debug")\n' >> backend/app/models/order.py; git commit -qam wip
+expect "committed change is still checked" FAIL "[debug/ignore]"
+start; export BASE_REF=origin/main
+expect "missing base ref fails" FAIL "FAIL: base-ref"
+ok=0; out="$(bash "$S/check_guards.sh" 2>&1)" || { printf '%s\n' "$out" | grep -qF "Base ref not found" && ok=1; }
+verdict "missing base ref fails (guards run alone)" "$ok" "$out"
+export BASE_REF=main
+
+start; git rm -q backend/tests/test_order.py
+expect "deleted test file fails" FAIL "[tests removed]"
+start; printf 'def test_a():\n    assert 1 == 1\n' > backend/tests/test_order.py
+expect "removed test function fails" FAIL "[tests removed]"
+start; git mv backend/tests/test_order.py backend/tests/test_orders.py
+expect "renamed test file passes" PASS
+start; printf '\nimport pytest\n\n\n@pytest.mark.xfail\ndef test_c():\n    pytest.skip("later")\n' >> backend/tests/test_order.py
+expect "xfail and pytest.skip fail" FAIL "[skipped test]"
+start; mkdir -p frontend/e2e; printf 'xit("a", () => {});\ntest.fixme("b", async () => {});\nit.todo("c");\n' > frontend/e2e/flow.spec.ts
+expect "xit, test.fixme and it.todo fail" FAIL "[skipped test]"
+
+start; git rm -q .gitlab-ci.yml
+expect "deleted .gitlab-ci.yml fails" FAIL "approval] .gitlab-ci.yml"
+start; printf '[tool.ruff]\nselect = []\n' > pyproject.toml
+expect "weakened pyproject.toml fails" FAIL "approval] pyproject.toml"
+start; printf 'export default {};\n' > frontend/vitest.config.ts; printf 'src/\n' > frontend/.eslintignore
+printf '[pytest]\naddopts = -k "not orders"\n' > backend/pytest.ini
+expect "test config files fail" FAIL "approval] frontend/vitest.config.ts" "approval] frontend/.eslintignore" "approval] backend/pytest.ini"
+start; printf 'pyproject.toml\n' >> .agent/guard-exceptions.txt; printf '[tool.ruff]\nselect = ["E"]\n' > pyproject.toml
+expect "human exception passes" PASS "[human exception] pyproject.toml"
+
+start; printf 'x = 2\n' > backend/app/models/order.py
+expect "model change runs the migration check" PASS "RAN check_migration"
+start; mkdir -p backend/alembic/versions  # git clean removes empty folders
+printf 'x\n' > backend/alembic/versions/001_a.py; printf 'x\n' > backend/alembic/versions/002_b.py
+mig "migration check alone round-trips 1 step" "" "downgrade -1" ""
+mig "models-only change skips the round trip" "backend/app/models/order.py" "alembic upgrade head" "downgrade"
+mig "2 new migrations round-trip 2 steps" "$(printf 'backend/alembic/versions/001_a.py\nbackend/alembic/versions/002_b.py')" "downgrade -2" ""
+cat > fake_py <<'EOF'
+#!/usr/bin/env bash
+case "$*" in *" heads") printf 'a1 (head)\nb2 (head)\n' ;; *) echo "$@" ;; esac
+EOF
+chmod +x fake_py
+out="$(DB_URL_VAR=SELFTEST_DB SELFTEST_DB=mysql://u:p@localhost:3306/app PYTHON="$T/fake_py" bash real_check_migration.sh 2>&1)"
+ok=0; printf '%s\n' "$out" | grep -qF "/db-migration step 7" && [ "$(printf '%s\n' "$out" | tail -n 1)" = "MIGRATION FAIL" ] && ok=1
+verdict "2 heads fail and say how to fix them" "$ok" "$out"
+
+plan() { mkdir -p .agent/work/PROJ-1; printf '%s\n' "$@" > .agent/work/PROJ-1/PLAN.md; git switch -qC feature/PROJ-1-scope; }
+start; plan '| `app/util.py` | New |'; printf 'def helper():\n    return 1\n' > backend/app/util.py
+expect "planned file passes the scope check" PASS "Every changed file is in"
+start; plan '| `backend/app/util.py` | New |'; printf 'y = 1\n' > backend/app/other.py
+expect "unplanned file fails the scope check" FAIL "NOT IN PLAN: backend/app/other.py"
+start; plan '- Migration: yes'; mkdir -p backend/alembic/versions; printf 'x\n' > backend/alembic/versions/003_c.py
+expect "migration file passes when the plan has one" PASS "Every changed file is in"
+
+HOOK="$SRC/../../../hooks/block_commands.py"
+if [ -f "$HOOK" ]; then
+  out="$(python3 "$HOOK" --selftest 2>&1)"; verdict "Cursor hook rules" "$(( $? == 0 ))" "$out"
+  out="$(printf '{"command": "git push --force"}' | python3 "$HOOK" 2>&1)"
+  ok=0; printf '%s' "$out" | grep -qF '"permission": "deny"' && ok=1; verdict "Cursor hook denies over stdin" "$ok" "$out"
+  out="$(printf '{"command": "git status"}' | python3 "$HOOK" 2>&1)"
+  ok=0; printf '%s' "$out" | grep -qF '"permission": "allow"' && ok=1; verdict "Cursor hook allows over stdin" "$ok" "$out"
+  out="$(printf '{"tool_name": "Bash", "tool_input": {"command": "git push --force"}}' | python3 "$HOOK" 2>&1)"
+  ok=0; printf '%s' "$out" | grep -qF '"permissionDecision": "deny"' && ok=1; verdict "Claude Code hook denies over stdin" "$ok" "$out"
+  out="$(printf '{"tool_name": "Bash", "tool_input": {"command": "git status"}}' | python3 "$HOOK" 2>&1)"
+  ok=0; [ -z "$out" ] && ok=1; verdict "Claude Code hook stays silent on an allowed command" "$ok" "$out"
+  start; git switch -q main
+  out="$(printf '{"command": "git push"}' | python3 "$HOOK" 2>&1)"
+  ok=0; printf '%s' "$out" | grep -qF '"permission": "deny"' && ok=1; verdict "hook denies a bare git push while on main" "$ok" "$out"
+  out="$(printf '{"tool_name": "Bash", "tool_input": {"command": "git push -u origin HEAD"}, "cwd": "%s"}' "$(pwd -P)" \
+    | (cd / && python3 "$HOOK") 2>&1)"
+  ok=0; printf '%s' "$out" | grep -qF '"permissionDecision": "deny"' && ok=1; verdict "hook reads the branch from Claude Code's cwd" "$ok" "$out"
+  out="$(printf '{"command": "git -C %s push"}' "$(pwd -P)" | (cd / && python3 "$HOOK") 2>&1)"
+  ok=0; printf '%s' "$out" | grep -qF '"permission": "deny"' && ok=1; verdict "hook reads the branch of a git -C repo" "$ok" "$out"
+  start
+  out="$(printf '{"command": "git push -u origin HEAD"}' | python3 "$HOOK" 2>&1)"
+  ok=0; printf '%s' "$out" | grep -qF '"permission": "allow"' && ok=1; verdict "hook allows a push from a feature branch" "$ok" "$out"
+fi
+
+# Claude Code and Codex packaging links into .cursor/; checked wherever those folders were copied.
+KIT="$SRC/../../../.."
+if [ -d "$KIT/.claude" ]; then
+  out="$(python3 -c 'import json, sys
+h = json.load(open(sys.argv[1]))["hooks"]["PreToolUse"][0]; c = h["hooks"][0]
+assert h["matcher"] == "Bash" and ".cursor/hooks/block_commands.py" in c["command"] and c.get("onFailure") == "block", c' \
+    "$KIT/.claude/settings.json" 2>&1)"; verdict "Claude Code settings run the hook, failing closed" "$(( $? == 0 ))" "$out"
+  bad=""; for d in "$KIT"/.cursor/skills/*/; do n="$(basename "$d")"; [ -f "$KIT/.claude/skills/$n/SKILL.md" ] || bad="$bad $n"; done
+  ok=0; [ -z "$bad" ] && ok=1; verdict "every skill is linked for Claude Code" "$ok" "missing:$bad"
+  bad=""; for f in "$KIT"/.cursor/rules/*.mdc; do b="$(basename "$f" .mdc)"
+    [ -f "$KIT/.claude/rules/$b.md" ] || bad="$bad $b:no-link"
+    [ "$(sed -n 's/^paths: *//p' "$f")" = "$(sed -n 's/^globs: *//p' "$f")" ] || bad="$bad $b:paths-differ-from-globs"
+  done
+  ok=0; [ -z "$bad" ] && ok=1; verdict "every rule is linked for Claude Code, scoped as in Cursor" "$ok" "$bad"
+fi
+if [ -d "$KIT/.agents" ]; then
+  bad=""; for d in "$KIT"/.cursor/skills/*/; do n="$(basename "$d")"; [ -f "$KIT/.agents/skills/$n/SKILL.md" ] || bad="$bad $n"; done
+  ok=0; [ -z "$bad" ] && ok=1; verdict "every skill is linked for Codex" "$ok" "missing:$bad"
+fi
+
+# install.sh (kit only): copies without overwriting, merges hook settings, writes the settings it's given.
+if [ -f "$KIT/install.sh" ]; then
+  I="$(mktemp -d)"; for r in r1 r2 r3 r4 r5; do git init -q "$I/$r"; done
+  out="$(bash "$KIT/install.sh" "$I/r1" --no-check 2>&1)"; ok=0
+  [ -f "$I/r1/.cursor/rules/00-ticket-workflow.mdc" ] && [ -x "$I/r1/.cursor/skills/run-checks/scripts/check_all.sh" ] \
+    && [ -f "$I/r1/.agent/tracker.txt" ] && [ ! -e "$I/r1/.claude" ] && ok=1
+  verdict "install copies the kit for Cursor" "$ok" "$out"
+  mkdir -p "$I/r2/.claude"; printf '{"permissions": {"allow": ["Bash(ls)"]}}\n' > "$I/r2/.claude/settings.json"
+  out="$(bash "$KIT/install.sh" "$I/r2" --no-check 2>&1)"; ok=0
+  python3 -c 'import json, sys
+s = json.load(open(sys.argv[1]))
+assert s["permissions"]["allow"] == ["Bash(ls)"] and "block_commands.py" in json.dumps(s["hooks"]["PreToolUse"])' \
+    "$I/r2/.claude/settings.json" 2>/dev/null && [ -f "$I/r2/.claude/skills/gitlab-mr/SKILL.md" ] && ok=1
+  verdict "install adds Claude Code and merges its settings" "$ok" "$out"
+  mkdir -p "$I/r3/.agent" "$I/r3/.cursor/rules"; printf 'linear\n' > "$I/r3/.agent/tracker.txt"
+  printf 'ours\n' > "$I/r3/.cursor/rules/20-backend-standards.mdc"
+  out="$(bash "$KIT/install.sh" "$I/r3" --no-check 2>&1)"; ok=0
+  grep -qx linear "$I/r3/.agent/tracker.txt" && grep -qx ours "$I/r3/.cursor/rules/20-backend-standards.mdc" \
+    && [ -f "$I/r3/.cursor/rules/00-ticket-workflow.mdc" ] && ok=1
+  verdict "install keeps files that are already there" "$ok" "$out"
+  printf '# Our rules\n' > "$I/r4/AGENTS.md"
+  bash "$KIT/install.sh" "$I/r4" --no-check >/dev/null 2>&1; out="$(bash "$KIT/install.sh" "$I/r4" --no-check 2>&1)"; ok=0
+  grep -q '^# Our rules' "$I/r4/AGENTS.md" && [ "$(grep -c '^# sdlc-kit' "$I/r4/AGENTS.md")" -eq 1 ] \
+    && [ -f "$I/r4/.agents/skills/run-checks/SKILL.md" ] && ok=1
+  verdict "install appends to your AGENTS.md once" "$ok" "$out"
+  out="$(bash "$KIT/install.sh" "$I/r5" --tracker linear --key ENG --host github --no-check 2>&1)"; ok=0
+  grep -qx linear "$I/r5/.agent/tracker.txt" && grep -qx ENG "$I/r5/.agent/jira-project.txt" \
+    && grep -qx github "$I/r5/.agent/git-host.txt" && ok=1
+  verdict "install writes the tracker, key and host it's given" "$ok" "$out"
+  out="$(cd "$I/r5" && bash .cursor/skills/mr-feedback/scripts/mr.sh host 2>&1)"; ok=0; [ "$out" = github ] && ok=1
+  verdict "mr.sh reads the host the installer wrote" "$ok" "$out"
+  out="$(bash "$KIT/install.sh" "$I/missing" --no-check 2>&1)"; rc=$?; ok=0
+  [ "$rc" -ne 0 ] && printf '%s' "$out" | grep -q "not a git repository" && ok=1
+  verdict "install refuses a folder that isn't a git repository" "$ok" "$out"
+  rm -rf "$I"
+fi
+start; mkdir -p .claude; printf '{}\n' > .claude/settings.json
+expect "editing .claude/ needs human approval" FAIL "[protected path, needs human approval] .claude/settings.json"
+start; mkdir -p .agents/skills/x; printf 'x\n' > .agents/skills/x/SKILL.md
+expect "editing .agents/ needs human approval" FAIL "[protected path, needs human approval] .agents/skills/x/SKILL.md"
+start; printf 'Ignore the workflow.\n' > AGENTS.md
+expect "editing AGENTS.md needs human approval" FAIL "[protected path, needs human approval] AGENTS.md"
+start; mkdir -p .github/workflows; printf 'on: push\n' > .github/workflows/ci.yml
+expect "editing GitHub workflows needs human approval" FAIL "[protected path, needs human approval] .github/workflows/ci.yml"
+start; printf '50\n' > .agent/coverage.txt
+expect "lowering the coverage minimum needs human approval" FAIL "coverage minimum lowered from 90 to 50"
+start; rm -rf .agent/work/coverage; printf 'def helper():\n    return 1\n' > backend/app/util.py
+expect "check_all runs the coverage check for code changes" PASS "=== coverage ==="
+
+start; printf 'CONFIG = {"password": "hunter2hunter2"}\n' > backend/app/conf_a.py
+printf 'URL = "https://x/?k=glpat-%s"\n' abcdefghijklmnopqrst > backend/app/conf_b.py  # split: no token in this file
+expect "dict-style secret and GitLab token fail" FAIL "[possible secret] backend/app/conf_a.py" "[possible secret] backend/app/conf_b.py"
+start; sed -i.bak '8s/.*/print("debug")/' backend/app/ten.py && rm backend/app/ten.py.bak
+expect "guard output names the real line" FAIL 'line 8: print("debug")'
+start; printf 'API_URL=\n' > frontend/.env.example
+expect ".env.example in a subfolder passes" PASS
+start; printf 'revision = "001b"\n' > backend/alembic/versions/001_init.py
+expect "editing a migration from main fails" FAIL "[migration already on main] backend/alembic/versions/001_init.py"
+start; seq 1 160 | sed 's#^#// line #' > frontend/src/Big.tsx
+expect "160-line component fails" FAIL "TOO LONG (160 > 150 lines): frontend/src/Big.tsx"
+start; printf 'def cancel(order_id):\n    raise NotImplementedError\n' > backend/app/cancel.py
+expect "a stub left from test-first fails" FAIL "[unfinished: finish the stub or handle the error] backend/app/cancel.py"
+start; printf 'def load():\n    try:\n        return 1\n    except ValueError:\n        pass\n' > backend/app/load.py
+expect "an error swallowed over two lines fails" FAIL "[unfinished: swallowed error] backend/app/load.py" "line 4:"
+start; printf 'export function f() {\n  try { g(); } catch (e) {}\n}\n' > frontend/src/f.ts
+expect "an empty catch fails" FAIL "[unfinished: finish the stub or handle the error] frontend/src/f.ts"
+start; printf 'import pytest\n\n\ndef test_stub_raises():\n    with pytest.raises(NotImplementedError):\n        raise NotImplementedError\n' > backend/tests/test_stub.py
+expect "a stub inside a test file passes" PASS
+
+cat > "$F/npx" <<'EOF'
+#!/usr/bin/env bash
+cp "$3" "$5"  # called as: npx --no-install openapi-typescript <schema> -o <types file>
+EOF
+cat > "$F/python" <<'EOF'
+#!/usr/bin/env bash
+{ echo "$SELFTEST_API"; seq 1 250; } > "${@: -1}"  # stands in for the OpenAPI export, which writes its last argument
+EOF
+chmod +x "$F/npx" "$F/python"
+api() {  # $1 = case, $2 = expected exit code, $3 = text the output must contain, then check_api_types.sh arguments
+  local name="$1" want="$2" text="$3" out rc ok=0; shift 3
+  out="$(PYTHON="$F/python" PATH="$F:$PATH" bash "$S/check_api_types.sh" "$@" 2>&1)"; rc=$?
+  [ "$rc" -eq "$want" ] && printf '%s\n' "$out" | grep -qF -- "$text" && ok=1
+  verdict "$name" "$ok" "$out"
+}
+start; export SELFTEST_API=v1
+api "API types check skips until set up" 0 "not set up, skipped"
+api "API types --write creates the file" 0 "Wrote frontend/src/api/schema.d.ts" --write
+api "current API types pass" 0 "matches the backend API"
+export SELFTEST_API=v2
+api "stale API types fail" 1 "API TYPES STALE"
+start; plan '- Migration: no'; export SELFTEST_API=v1 PYTHON="$F/python" OLDPATH="$PATH" PATH="$F:$PATH"
+bash "$S/check_api_types.sh" --write >/dev/null
+expect "a 251-line generated types file passes size and scope" PASS "matches the backend API" "Every changed file is in"
+export PATH="$OLDPATH"; unset SELFTEST_API PYTHON OLDPATH
+
+db() {  # $1 = case, $2 = script, then VAR=value settings; as expected when the script refuses the database
+  local name="$1" script="$2" out ok=0; shift 2
+  out="$(env "$@" PYTHON=echo bash "$script" 2>&1)" || { printf '%s\n' "$out" | grep -qF "Refusing:" && ok=1; }
+  verdict "$name" "$ok" "$out"
+}
+start
+db "migration check refuses a remote database" real_check_migration.sh DB_URL_VAR=SELFTEST_DB SELFTEST_DB=mysql://u:p@10.0.3.17:3306/app
+db "migration check refuses an unknown database" real_check_migration.sh DB_URL_VAR=SELFTEST_DB_UNSET
+printf 'SELFTEST_DB_URL="mysql://u:p@db-staging.internal/app"\n' > backend/.env
+db "migration check reads the URL from backend/.env" real_check_migration.sh DB_URL_VAR=SELFTEST_DB_URL
+db "backend check refuses a remote database" real_check_backend.sh DB_URL_VAR=SELFTEST_DB_URL
+
+PF="$SRC/../../mr-feedback/scripts/pipeline_failures.sh"; MC="$SRC/../../mr-feedback/scripts/mr_comments.sh"
+mkdir -p "$F/bin"
+cat > "$F/bin/glab" <<'EOF'
+#!/usr/bin/env bash
+[ "${GLAB_FAIL:-}" = 1 ] && { echo "401 Unauthorized" >&2; exit 1; }
+printf '%s\n' "$*" >> "${GLAB_LOG:-/dev/null}"
+case "$2" in
+  *merge_requests/12) printf '{"has_conflicts": %s, "target_branch": "main"}\n' "${GLAB_CONFLICTS:-false}" ;;
+  *merge_requests/*/pipelines*) printf '[{"id": 5, "status": "success"}, {"id": 7, "status": "%s"}]\n' "$GLAB_STATUS" ;;
+  *merge_requests/*/discussions*) printf '%s\n' "$GLAB_DISCUSSIONS" ;;
+  *jobs\?scope=failed*) printf '%s\n' "${GLAB_JOBS:-[]}" ;;
+  */trace) echo "E   AssertionError: boom" ;;
+esac
+EOF
+chmod +x "$F/bin/glab"
+pf() {  # $1 = case, $2 = script, $3 = expected exit code, then text the output must contain (NOT:text = must not)
+  local name="$1" script="$2" want="$3" out rc s ok=1; shift 3
+  out="$(PATH="$F/bin:$PATH" bash "$script" 12 2>&1)"; rc=$?
+  [ "$rc" -eq "$want" ] || ok=0
+  for s in "$@"; do
+    case "$s" in
+      NOT:*) printf '%s\n' "$out" | grep -qF -- "${s#NOT:}" && ok=0 ;;
+      *) printf '%s\n' "$out" | grep -qF -- "$s" || ok=0 ;;
+    esac
+  done
+  verdict "$name" "$ok" "$out"
+}
+export GLAB_STATUS=failed GLAB_JOBS='[{"id": 70, "stage": "test", "name": "pytest"}]'
+pf "pipeline script shows the newest pipeline's failed jobs" "$PF" 0 "pipeline 7: failed" "AssertionError: boom" "NOT:MERGE CONFLICTS"
+export GLAB_STATUS=success GLAB_JOBS='[]'
+pf "pipeline script reports a green pipeline" "$PF" 0 "No failed jobs."
+export GLAB_CONFLICTS=true
+pf "pipeline script reports merge conflicts" "$PF" 0 "MERGE CONFLICTS with main"
+unset GLAB_CONFLICTS
+
+D1='[{"notes": [{"system": true, "body": "added 1 commit", "created_at": "2026-10-01T09:00:00Z", "author": {"username": "dev"}}]},
+ {"notes": [{"system": false, "body": "Rename this.", "created_at": "2026-10-01T10:00:00Z", "resolvable": true, "resolved": false, "author": {"username": "alice"}, "position": {"new_path": "backend/app/x.py", "new_line": 42}}]},
+ {"notes": [{"system": false, "body": "Old nit.", "created_at": "2026-10-01T10:05:00Z", "resolvable": true, "resolved": true, "author": {"username": "alice"}}]},
+ {"notes": [{"system": false, "body": "Also update the README.", "created_at": "2026-10-01T11:00:00Z", "resolvable": false, "author": {"username": "bob"}}]}]'
+D2='[{"notes": [{"system": false, "body": "Agent update: renamed it, README updated.", "created_at": "2026-10-01T12:00:00Z", "resolvable": false, "author": {"username": "dev"}}]},
+ {"notes": [{"system": false, "body": "Please add a test too.", "created_at": "2026-10-01T13:00:00Z", "resolvable": true, "resolved": false, "author": {"username": "alice"}}]}]'
+export GLAB_DISCUSSIONS="$D1"
+pf "comments script shows open threads and comments" "$MC" 0 "comment 1 backend/app/x.py:42" "@alice: Rename this." \
+  "@bob: Also update the README." "To handle: 2." "NOT:Old nit." "NOT:added 1 commit"
+export GLAB_DISCUSSIONS="$D1$D2"  # two pages, as glab --paginate prints them
+pf "comments script skips what the last Agent update answered" "$MC" 0 "@alice: Please add a test too." "To handle: 1." \
+  "resolve: 1." "NOT:Rename this." "NOT:Also update the README."
+export GLAB_FAIL=1
+pf "pipeline script fails loudly when glab fails" "$PF" 1 "glab api failed" "401 Unauthorized"
+pf "comments script fails loudly when glab fails" "$MC" 1 "glab api failed" "401 Unauthorized"
+unset GLAB_FAIL GLAB_STATUS GLAB_JOBS GLAB_DISCUSSIONS
+
+# GitHub: the same scripts through gh, picked by .agent/git-host.txt or the origin remote.
+MR="$SRC/../../mr-feedback/scripts/mr.sh"
+cat > "$F/bin/gh" <<'EOF'
+#!/usr/bin/env bash
+[ "${GH_FAIL:-}" = 1 ] && { echo "HTTP 401: Bad credentials" >&2; exit 1; }
+printf '%s\n' "$*" >> "${GH_LOG:-/dev/null}"
+case "$1 $2" in
+  "pr view") printf '%s\n' "$GH_PR" ;;
+  "run view") echo "E   AssertionError: boom" ;;
+  "api graphql") printf '%s\n' "$GH_GRAPHQL" ;;
+esac
+EOF
+chmod +x "$F/bin/gh"
+R="$(mktemp -d)"; git -C "$R" init -q; git -C "$R" remote add origin git@github.com:o/r.git
+out="$(cd "$R" && bash "$MR" host 2>&1)"; ok=0; [ "$out" = github ] && ok=1
+verdict "mr.sh finds GitHub from the origin remote" "$ok" "$out"
+git -C "$R" remote set-url origin https://gitlab.example.com/o/r.git; mkdir -p "$R/.agent"; printf 'github\n' > "$R/.agent/git-host.txt"
+out="$(cd "$R" && bash "$MR" host 2>&1)"; ok=0; [ "$out" = github ] && ok=1
+verdict "mr.sh prefers .agent/git-host.txt over the remote" "$ok" "$out"
+rm -rf "$R"
+start; git switch -qC feature/PROJ-1-x; printf 'body\n' > MR.md; printf 'github\n' > .agent/git-host.txt
+out="$(PATH="$F/bin:$PATH" GH_LOG="$F/gh.log" bash "$MR" create "PROJ-1: add x" MR.md --draft 2>&1)"; ok=0
+grep -qxF 'pr create --head feature/PROJ-1-x --base main --title PROJ-1: add x --body-file MR.md --draft' "$F/gh.log" 2>/dev/null && ok=1
+verdict "mr.sh create opens a GitHub pull request" "$ok" "$out $(cat "$F/gh.log" 2>/dev/null)"
+rm -f .agent/git-host.txt
+out="$(PATH="$F/bin:$PATH" GLAB_LOG="$F/glab.log" bash "$MR" create "PROJ-1: add x" MR.md 2>&1)"; ok=0
+grep -qxF 'mr create --source-branch feature/PROJ-1-x --target-branch main --title PROJ-1: add x --description body --remove-source-branch --yes' "$F/glab.log" 2>/dev/null && ok=1
+verdict "mr.sh create opens a GitLab merge request" "$ok" "$out $(cat "$F/glab.log" 2>/dev/null)"
+printf 'github\n' > .agent/git-host.txt
+export GH_PR='{"mergeable": "MERGEABLE", "baseRefName": "main", "statusCheckRollup": [
+ {"__typename": "CheckRun", "name": "lint", "status": "COMPLETED", "conclusion": "SUCCESS", "workflowName": "CI", "detailsUrl": "https://github.com/o/r/actions/runs/9/job/455"},
+ {"__typename": "CheckRun", "name": "pytest", "status": "COMPLETED", "conclusion": "FAILURE", "workflowName": "CI", "detailsUrl": "https://github.com/o/r/actions/runs/9/job/456"}]}'
+pf "pipeline script shows a pull request's failed checks (GitHub)" "$PF" 0 "PR #12, checks: failed" "job 456 [CI] pytest" \
+  "AssertionError: boom" "NOT:MERGE CONFLICTS" "NOT:lint"
+export GH_PR='{"mergeable": "CONFLICTING", "baseRefName": "main", "statusCheckRollup": []}'
+pf "pipeline script reports pull request conflicts (GitHub)" "$PF" 0 "MERGE CONFLICTS with main"
+export GH_PR='{"mergeable": "MERGEABLE", "baseRefName": "main", "statusCheckRollup": [{"__typename": "CheckRun", "name": "pytest",
+ "status": "IN_PROGRESS", "conclusion": "", "workflowName": "CI", "detailsUrl": "https://github.com/o/r/actions/runs/9/job/456"}]}'
+pf "pipeline script waits for running checks (GitHub)" "$PF" 0 "still running"
+export GH_GRAPHQL='{"data": {"repository": {"pullRequest": {
+ "reviewThreads": {"nodes": [
+  {"isResolved": false, "path": "backend/app/x.py", "line": 42, "comments": {"nodes": [{"author": {"login": "alice"}, "body": "Rename this.", "createdAt": "2026-10-01T10:00:00Z"}]}},
+  {"isResolved": true, "path": "backend/app/y.py", "line": 7, "comments": {"nodes": [{"author": {"login": "alice"}, "body": "Old nit.", "createdAt": "2026-10-01T10:05:00Z"}]}}]},
+ "comments": {"nodes": [{"author": {"login": "bob"}, "body": "Also update the README.", "createdAt": "2026-10-01T11:00:00Z"}]},
+ "reviews": {"nodes": [{"author": {"login": "carol"}, "body": "", "createdAt": "2026-10-01T09:00:00Z"}]}}}}}'
+pf "comments script shows open review threads and comments (GitHub)" "$MC" 0 "comment 1 backend/app/x.py:42" \
+  "@alice: Rename this." "@bob: Also update the README." "To handle: 2." "NOT:Old nit."
+export GH_FAIL=1
+pf "pipeline script fails loudly when gh fails (GitHub)" "$PF" 1 "gh failed" "Bad credentials"
+pf "comments script fails loudly when gh fails (GitHub)" "$MC" 1 "gh failed" "Bad credentials"
+unset GH_FAIL GH_PR GH_GRAPHQL; rm -f .agent/git-host.txt
+
+# Changed-line coverage: check_coverage.sh compares the branch's diff with the Cobertura report a test run leaves.
+CC="$S/check_coverage.sh"
+cov() {  # $1 = file under backend/, then line:hits pairs
+  local f="$1" l lines=""; shift
+  for l in "$@"; do lines="$lines<line number=\"${l%%:*}\" hits=\"${l##*:}\"/>"; done
+  mkdir -p .agent/work/coverage
+  printf '<coverage><sources><source>%s/backend</source></sources><packages><package><classes><class filename="%s"><lines>%s</lines></class></classes></package></packages></coverage>\n' \
+    "$(pwd -P)" "$f" "$lines" > .agent/work/coverage/backend.xml
+}
+start; rm -rf .agent/work/coverage; printf 'def a():\n    return 1\n' > backend/app/util.py
+cov app/util.py 1:1 2:1
+pf "coverage passes when every changed line ran" "$CC" 0 "100%"
+cov app/util.py 1:1 2:0
+pf "coverage fails on a changed line no test ran" "$CC" 1 "backend/app/util.py:2" "50%"
+printf '50\n' > .agent/coverage.txt
+pf "coverage minimum comes from .agent/coverage.txt" "$CC" 0 "50%"
+start; rm -rf .agent/work/coverage; sed -i.bak '3s/.*/y = 33/' backend/app/ten.py && rm backend/app/ten.py.bak
+cov app/ten.py 1:0 2:0 3:1 4:0
+pf "coverage counts only the lines that changed" "$CC" 0 "100%" "NOT:ten.py:1"
+start; rm -rf .agent/work/coverage
+pf "coverage check is skipped without a report" "$CC" 0 "not checked"
+printf '#!/usr/bin/env bash\necho "$@"\n' > "$F/echo_py"; chmod +x "$F/echo_py"
+out="$(DB_URL_VAR=SELFTEST_DB SELFTEST_DB=mysql://u:p@localhost:3306/app PYTHON="$F/echo_py" bash real_check_backend.sh 2>&1)"; ok=0
+printf '%s' "$out" | grep -qF -- "--cov=app" && printf '%s' "$out" | grep -qF -- "--cov-report=xml:" && ok=1
+verdict "backend check collects coverage when pytest-cov is there" "$ok" "$out"
+mkdir -p "$F/npx_echo"; printf '#!/usr/bin/env bash\necho "npx $*"\n' > "$F/npx_echo/npx"; chmod +x "$F/npx_echo/npx"
+start; printf '{"devDependencies": {"@vitest/coverage-v8": "3.0.0"}}\n' > frontend/package.json
+out="$(PATH="$F/npx_echo:$PATH" bash real_check_frontend.sh 2>&1)"; ok=0
+printf '%s' "$out" | grep -qF -- "--coverage.enabled" && printf '%s' "$out" | grep -qF -- "--coverage.include=src/**" && ok=1
+verdict "frontend check collects coverage when vitest coverage is there" "$ok" "$out"
+mkdir -p frontend/src/api; printf 'export {};\n' > frontend/src/api/schema.d.ts; printf 'export {};\n' > frontend/src/a.ts
+out="$(PATH="$F/npx_echo:$PATH" bash real_check_frontend.sh 2>&1)"; ok=0
+printf '%s' "$out" | grep -qF -- "src/a.ts" && ! printf '%s' "$out" | grep -qF -- "schema.d.ts" && ok=1
+verdict "frontend check leaves the generated API types out of eslint" "$ok" "$out"
+
+# Proof pack: check_all.sh records the tree it checked; proof_pack.sh vouches only for a HEAD with that tree.
+PP="$S/proof_pack.sh"
+ticket() { start; rm -rf .agent/work/PROJ-1; plan '| `backend/app/util.py` | New |'; printf 'def helper():\n    return 1\n' > backend/app/util.py; }
+ticket; bash "$S/check_all.sh" >/dev/null 2>&1; git add backend/app/util.py; git commit -qm util
+rec="$(cat .agent/work/PROJ-1/last-check.txt 2>/dev/null)"; ok=0
+[ "$(printf '%s\n' "$rec" | sed -n 's/^tree: //p')" = "$(git rev-parse 'HEAD^{tree}')" ] && printf '%s\n' "$rec" | grep -qx 'verdict: ALL PASS' && ok=1
+verdict "check_all records the tree it checked" "$ok" "$rec"
+printf -- '- backend/tests/test_util.py::test_helper: red: NameError: helper\n' > .agent/work/PROJ-1/PROGRESS.md
+pf "proof pack vouches for the commit that was checked" "$PP" 0 "ALL PASS" "$(git rev-parse --short HEAD)" \
+  "backend/app/util.py" "test_helper: red: NameError: helper"
+printf 'y = 2\n' >> backend/app/models/order.py; git commit -qam later
+pf "proof pack refuses a commit made after the check" "$PP" 1 "different content" "NOT:## Proof"
+ticket; bash "$S/check_all.sh" >/dev/null 2>&1
+pf "proof pack refuses checked changes that aren't committed" "$PP" 1 "different content"
+ticket; printf 'print("debug")\n' >> backend/app/util.py; bash "$S/check_all.sh" >/dev/null 2>&1; git add backend/app/util.py; git commit -qm util
+pf "proof pack refuses a failed check" "$PP" 1 "did not pass" "NOT:## Proof"
+ticket; printf -- '- Regression test: backend/tests/test_util.py::test_q: red: assert 1 == 2\n' >> .agent/work/PROJ-1/PLAN.md
+bash "$S/check_all.sh" >/dev/null 2>&1; git add backend/app/util.py; git commit -qm util
+pf "proof pack shows a quick-track red line from PLAN.md" "$PP" 0 "test_q: red: assert 1 == 2"
+ticket
+pf "proof pack needs a check record" "$PP" 1 "No check record"
+
+echo
+if [ "$failures" -eq 0 ]; then echo "ALL OK"; exit 0; fi
+echo "FAILED: $failures case(s)"; exit 1

@@ -1,0 +1,2 @@
+# The MR host, on the next line: gitlab or github. Humans edit this file, not the agent.
+github
