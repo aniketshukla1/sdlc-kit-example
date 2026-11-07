@@ -1,0 +1,38 @@
+---
+name: gitlab-mr
+description: Phase 7. Commits, rebases, pushes the branch and opens the merge request (a pull request on GitHub), then links it on the ticket. Use after self-review is done and run-checks prints ALL PASS.
+---
+# Open the MR (phase 7)
+
+## Steps
+1. Run /run-checks now. Continue only on `ALL PASS`.
+2. Check what will be committed: `git status --short`.
+   Must NOT appear: `.agent/work/`, `.env` files, build output, files not in PLAN.md.
+3. Stage files explicitly: `git add <file> <file> ...` (never `git add -A` or `git add .`).
+4. Commit, one commit per logical part (e.g. migration, backend, frontend, tests):
+   `git commit -m "<KEY>: <type>(<scope>): <imperative summary, ≤ 72 chars>"`
+   `<type>` = feat | fix | refactor | test | chore. Example: `PROJ-123: feat(orders): add cancel endpoint`
+5. Update with main: `git fetch origin && git rebase origin/main`.
+   Conflict in a file you did not change, or you're unsure → `git rebase --abort` and ask the human.
+   After a rebase, run /run-checks again (2 Alembic heads → /db-migration step 7).
+6. Push: `git push -u origin HEAD`. Never `--force`. If a push is rejected, ask the human.
+7. Proof: `bash .cursor/skills/run-checks/scripts/proof_pack.sh > .agent/work/<KEY>/proof.md`.
+   It refuses if anything changed after the last `ALL PASS` (an edit, a commit, a rebase): run /run-checks,
+   commit any fix, push, and run it again. Never write or edit the proof by hand.
+8. Fill `mr-template.md` (next to this file) into `.agent/work/<KEY>/MR.md`. Every section, or `None`.
+   The Proof section is `proof.md`, pasted unedited.
+9. Create the MR (GitLab or GitHub; `mr.sh` picks the host):
+   `bash .cursor/skills/mr-feedback/scripts/mr.sh create "<KEY>: <summary>" .agent/work/<KEY>/MR.md`
+   Add `--draft` at the end if "Human actions required" is not `None`.
+   Verify: it prints a URL ending in `/merge_requests/<IID>` or `/pull/<IID>`. The IID is that number.
+10. Save MR URL and IID in PROGRESS.md. Set `Phase: 7-mr (open)`.
+   PROGRESS.md has `Parent: <KEY>`? Also set this sub-task's row in that parent's Roadmap (its PLAN.md) to `MR !<IID>`.
+11. Post a comment (tracker MCP) on the ticket, and on its parent if it has one: `Agent: MR ready for review: <url>`.
+    A `CHAT-<n>` key has no ticket: skip this.
+12. Tell the human: `MR created: <url>. After review or a pipeline result, start a new chat and type: Continue <KEY>`.
+
+## Done when
+- [ ] Only planned files committed, commit messages follow the format
+- [ ] Branch pushed without force, MR created against `main`
+- [ ] The MR's Proof section is `proof_pack.sh` output for the pushed head, unedited
+- [ ] MR URL in PROGRESS.md and on the ticket
