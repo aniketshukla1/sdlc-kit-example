@@ -87,7 +87,7 @@ Using the kit on a real repo found problems that its 96 self-tests had missed.
 
 ## What this run doesn't show
 
-- **Review feedback (phase 8):** nobody left comments, and this repo has no CI.
+- **Review feedback (phase 8):** nobody left comments, and this repo had no CI during the run.
 - **Jira, Linear and GitLab:** this run used `/chat` and GitHub only.
 - **A hard bug or a large codebase:** the app has one route and one page, and the agent already knew the bug.
 
