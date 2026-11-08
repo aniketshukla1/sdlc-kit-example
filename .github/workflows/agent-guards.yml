@@ -1,0 +1,20 @@
+name: agent-guards
+on: pull_request
+permissions:
+  contents: read
+jobs:
+  agent-guards:
+    runs-on: ubuntu-latest  # has bash, git and python3
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 0  # the base branch too, for the merge base
+      - name: Guards from the base branch's copy
+        env:
+          BASE_REF: origin/${{ github.base_ref }}
+        run: |
+          mkdir /tmp/main && git archive "$BASE_REF" .cursor/skills/run-checks/scripts | tar -x -C /tmp/main
+          bash /tmp/main/.cursor/skills/run-checks/scripts/check_size.sh
+          bash /tmp/main/.cursor/skills/run-checks/scripts/check_guards.sh
+      - name: Self-tests (this pull request's copy, so changes to the scripts get tested)
+        run: bash .cursor/skills/run-checks/scripts/selftest.sh
