@@ -12,6 +12,7 @@ export function OrderSummary({ order }: OrderSummaryProps) {
         <thead>
           <tr>
             <th scope="col">Item</th>
+            <th scope="col">Quantity</th>
             <th scope="col">Unit price</th>
           </tr>
         </thead>
@@ -19,13 +20,14 @@ export function OrderSummary({ order }: OrderSummaryProps) {
           {order.lines.map((line) => (
             <tr key={line.sku}>
               <td>{line.name}</td>
+              <td>{line.quantity}</td>
               <td>${line.unit_price}</td>
             </tr>
           ))}
         </tbody>
         <tfoot>
           <tr>
-            <th scope="row">Total</th>
+            <th scope="row" colSpan={2}>Total</th>
             <td>${order.total}</td>
           </tr>
         </tfoot>
