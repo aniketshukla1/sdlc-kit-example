@@ -77,17 +77,18 @@ the PR unedited.
 
 Using the kit on a real repo found problems that its 96 self-tests had missed.
 
-| Finding | Status when this was written |
+| Finding | Status |
 |---------|------------------------------|
 | `install.sh --host` broke `mr.sh`, which read a comment line as the host name | Fixed in [sdlc-kit#2](https://github.com/aniketshukla1/sdlc-kit/pull/2) |
 | `check_frontend.sh` failed whenever a ticket regenerated the API types | Fixed in [sdlc-kit#2](https://github.com/aniketshukla1/sdlc-kit/pull/2) |
-| A command in the explore skill aborts under zsh when its glob matches nothing | Not fixed yet |
-| `/quick-fix` asks for one regression test, which doesn't fit a bug with two symptoms | Not fixed yet |
+| A command in the explore skill aborts under zsh when its glob matches nothing | Fixed in [sdlc-kit#3](https://github.com/aniketshukla1/sdlc-kit/pull/3) |
+| `/quick-fix` asks for one regression test, which doesn't fit a bug with two symptoms | Fixed in [sdlc-kit#3](https://github.com/aniketshukla1/sdlc-kit/pull/3) |
 | Changed-line coverage can't see JSX-only lines. The "1 of 1" above is the backend line, and the page test covers the 3 JSX lines | A known limit |
 
 ## What this run doesn't show
 
-- **Review feedback (phase 8):** nobody left comments, and this repo has no CI.
+- **Review feedback (phase 8):** nobody left comments, and this repo had no CI during the run. The `agent-guards`
+  workflow came afterwards, in [PR #4](https://github.com/aniketshukla1/sdlc-kit-example/pull/4).
 - **Jira, Linear and GitLab:** this run used `/chat` and GitHub only.
 - **A hard bug or a large codebase:** the app has one route and one page, and the agent already knew the bug.
 
