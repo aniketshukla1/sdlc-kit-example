@@ -1,5 +1,5 @@
 import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
-import { cleanup, fireEvent, render, screen } from "@testing-library/react";
+import { cleanup, fireEvent, render, screen, within } from "@testing-library/react";
 import { afterEach, expect, it, vi } from "vitest";
 
 import type { Order } from "@/features/orders/api/useOrder";
@@ -51,6 +51,23 @@ it("shows each line's name and price, and the order total", async () => {
   expect(cells).toEqual(
     expect.arrayContaining(["Green tea 250 g", "$10.00", "Ceramic mug", "$14.50", "$34.50"]),
   );
+});
+
+it("shows how many of each item were ordered", async () => {
+  vi.stubGlobal("fetch", vi.fn().mockResolvedValue(jsonResponse(ORDER)));
+  const [tea, mug] = ORDER.lines;
+
+  renderPage();
+
+  await screen.findByRole("heading");
+  const headers = screen.getAllByRole("columnheader").map((header) => header.textContent);
+  const cellsOf = (name: RegExp) =>
+    within(screen.getByRole("row", { name }))
+      .getAllByRole("cell")
+      .map((cell) => cell.textContent);
+  expect(headers).toEqual(["Item", "Quantity", "Unit price"]);
+  expect(cellsOf(/Green tea/)).toEqual([tea.name, String(tea.quantity), `$${tea.unit_price}`]);
+  expect(cellsOf(/Ceramic mug/)).toEqual([mug.name, String(mug.quantity), `$${mug.unit_price}`]);
 });
 
 it("says so when the order has no items", async () => {

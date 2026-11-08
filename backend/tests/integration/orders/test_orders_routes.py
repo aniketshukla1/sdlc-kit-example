@@ -17,6 +17,13 @@ def test_read_order_returns_its_lines() -> None:
     ]
 
 
+def test_read_order_total_counts_each_line_quantity() -> None:
+    response = client.get("/api/v1/orders/1001")
+
+    assert response.status_code == 200
+    assert response.json()["total"] == "34.50"
+
+
 def test_read_order_without_lines_has_zero_total() -> None:
     response = client.get("/api/v1/orders/1002")
 

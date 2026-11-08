@@ -27,6 +27,16 @@ def test_get_order_total_adds_up_the_lines() -> None:
     assert result.total == Decimal("24.50")
 
 
+def test_get_order_total_multiplies_each_unit_price_by_its_quantity() -> None:
+    tea = OrderLine("TEA", "Tea", Decimal("10.00"), 3)
+    mug = OrderLine("MUG", "Mug", Decimal("14.50"), 1)
+    service = service_with(Order(id=7, lines=(tea, mug)))
+
+    result = service.get_order(7)
+
+    assert result.total == tea.unit_price * tea.quantity + mug.unit_price * mug.quantity
+
+
 def test_get_order_without_lines_has_zero_total() -> None:
     service = service_with(Order(id=7, lines=()))
 
