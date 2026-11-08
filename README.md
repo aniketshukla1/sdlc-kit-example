@@ -38,5 +38,3 @@ PATH="$PWD/backend/.venv/bin:$PATH" bash .cursor/skills/run-checks/scripts/check
 ```
 
 The last line is `ALL PASS` or `FAIL: <checks>`.
-
-<!-- Throwaway change: this PR only exercises the agent-guards workflow. -->
